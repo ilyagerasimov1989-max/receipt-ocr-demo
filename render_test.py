@@ -6,16 +6,21 @@ import json
 import os
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 def recognize(data: bytes) -> dict[str, str]:
-    result = subprocess.run(
-        ["tesseract", "stdin", "stdout", "--psm", "6"],
-        input=data,
-        capture_output=True,
-        timeout=10,
-        check=True,
-    )
+    with TemporaryDirectory(prefix="receipt-fixture-") as directory:
+        image = Path(directory) / "fixture.png"
+        image.write_bytes(data)
+        result = subprocess.run(
+            ["tesseract", image, "stdout", "-l", "eng", "--psm", "6"],
+            env={**os.environ, "OMP_THREAD_LIMIT": "1"},
+            capture_output=True,
+            timeout=25,
+            check=True,
+        )
     return {
         key.strip(): value.strip()
         for key, separator, value in (line.partition(":") for line in result.stdout.decode().splitlines())
@@ -62,7 +67,11 @@ class ReceiptProbe(BaseHTTPRequestHandler):
             return self.reply(422, status="unknown_test_fixture")
         try:
             fields = recognize(data)
-        except (OSError, subprocess.SubprocessError, UnicodeError):
+        except subprocess.CalledProcessError as error:
+            print(f"Synthetic fixture OCR exited {error.returncode}: {error.stderr[:400]!r}", flush=True)
+            return self.reply(422, status="ocr_failed")
+        except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+            print(f"Synthetic fixture OCR failed: {type(error).__name__}", flush=True)
             return self.reply(422, status="ocr_failed")
         if fields.get("AMOUNT") != "4500.00 RUB" or fields.get("OPERATION") != "123456789012":
             return self.reply(422, status="ocr_fields_mismatch")
