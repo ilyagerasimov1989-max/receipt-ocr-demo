@@ -9,7 +9,29 @@ import os
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from re import fullmatch
 from tempfile import TemporaryDirectory
+from urllib.error import URLError
+from urllib.request import HTTPRedirectHandler, build_opener
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def download_fixture(url: str) -> bytes:
+    allowed = os.environ.get("RECEIPT_TEST_FIXTURE_URL", "")
+    if url != allowed or not fullmatch(
+        r"https://files\.salebot\.pro/uploads/file_item/file/[0-9]+/[a-zA-Z0-9_-]+\.png",
+        allowed,
+    ):
+        raise ValueError("Unrecognized fixture URL")
+    with build_opener(NoRedirect()).open(allowed, timeout=4) as response:
+        data = response.read(1_000_001)
+    if len(data) > 1_000_000:
+        raise ValueError("Fixture exceeds size limit")
+    return data
 
 
 def recognize(data: bytes) -> dict[str, str]:
@@ -20,7 +42,7 @@ def recognize(data: bytes) -> dict[str, str]:
             ["tesseract", image, "stdout", "-l", "eng", "--psm", "6"],
             env={**os.environ, "OMP_THREAD_LIMIT": "1"},
             capture_output=True,
-            timeout=25,
+            timeout=7,
             check=True,
         )
     return {
@@ -59,21 +81,28 @@ class ReceiptProbe(BaseHTTPRequestHandler):
         if not length.isascii() or not length.isdecimal() or not 0 < int(length) <= 1_000_000:
             return self.reply(400, status="invalid_size")
         media_type = self.headers.get_content_type()
-        if media_type not in {"image/png", "application/json"}:
-            return self.reply(415, status="invalid_type")
         self.connection.settimeout(10)
         try:
             data = self.rfile.read(int(length))
         except TimeoutError:
             return self.reply(408, status="timeout")
-        if media_type == "application/json":
+        if media_type == "application/json" or data.lstrip().startswith(b"{"):
             try:
                 payload = json.loads(data)
-                if not isinstance(payload, dict) or set(payload) != {"image_base64"}:
+                if not isinstance(payload, dict):
                     return self.reply(400, status="invalid_test_payload")
-                data = base64.b64decode(payload["image_base64"], validate=True)
+                if set(payload) == {"image_url"}:
+                    data = download_fixture(payload["image_url"])
+                elif set(payload) == {"image_base64"}:
+                    data = base64.b64decode(payload["image_base64"], validate=True)
+                else:
+                    return self.reply(400, status="invalid_test_payload")
             except (UnicodeError, ValueError, TypeError, binascii.Error):
                 return self.reply(400, status="invalid_test_payload")
+            except (URLError, OSError):
+                return self.reply(502, status="fixture_unavailable")
+        elif media_type != "image/png":
+            return self.reply(415, status="invalid_type")
         if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), fixture_digest):
             return self.reply(422, status="unknown_test_fixture")
         try:
