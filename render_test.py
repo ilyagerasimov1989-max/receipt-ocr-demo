@@ -63,13 +63,19 @@ class ReceiptProbe(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self.reply(200, status="ok", test_only=True)
-        else:
-            self.reply(404, status="not_found")
-
-    def do_POST(self):
-        if self.path != "/test/receipts":
+            return self.reply(200, status="ok", test_only=True)
+        if self.path != "/test/receipt-fixture":
             return self.reply(404, status="not_found")
+        fixture_digest = self.authorized_fixture_digest()
+        if fixture_digest is None:
+            return
+        try:
+            data = download_fixture(os.environ.get("RECEIPT_TEST_FIXTURE_URL", ""))
+        except (ValueError, OSError):
+            return self.reply(502, status="fixture_unavailable")
+        return self.recognize_fixture(data, fixture_digest)
+
+    def authorized_fixture_digest(self) -> str | None:
         token = os.environ.get("RECEIPT_TEST_TOKEN", "")
         fixture_digest = os.environ.get("RECEIPT_TEST_SHA256", "")
         if len(token) < 32 or len(fixture_digest) != 64:
@@ -77,6 +83,14 @@ class ReceiptProbe(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "").encode()
         if not hmac.compare_digest(authorization, f"Bearer {token}".encode()):
             return self.reply(401, status="unauthorized")
+        return fixture_digest
+
+    def do_POST(self):
+        if self.path != "/test/receipts":
+            return self.reply(404, status="not_found")
+        fixture_digest = self.authorized_fixture_digest()
+        if fixture_digest is None:
+            return
         length = self.headers.get("Content-Length", "")
         if not length.isascii() or not length.isdecimal() or not 0 < int(length) <= 1_000_000:
             return self.reply(400, status="invalid_size")
@@ -103,6 +117,9 @@ class ReceiptProbe(BaseHTTPRequestHandler):
                 return self.reply(502, status="fixture_unavailable")
         elif media_type != "image/png":
             return self.reply(415, status="invalid_type")
+        return self.recognize_fixture(data, fixture_digest)
+
+    def recognize_fixture(self, data: bytes, fixture_digest: str):
         if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), fixture_digest):
             return self.reply(422, status="unknown_test_fixture")
         try:
