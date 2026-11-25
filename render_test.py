@@ -1,5 +1,7 @@
 """Stateless HTTP probe for a synthetic receipt. Does not write payment records."""
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -56,13 +58,22 @@ class ReceiptProbe(BaseHTTPRequestHandler):
         length = self.headers.get("Content-Length", "")
         if not length.isascii() or not length.isdecimal() or not 0 < int(length) <= 1_000_000:
             return self.reply(400, status="invalid_size")
-        if self.headers.get_content_type() != "image/png":
+        media_type = self.headers.get_content_type()
+        if media_type not in {"image/png", "application/json"}:
             return self.reply(415, status="invalid_type")
         self.connection.settimeout(10)
         try:
             data = self.rfile.read(int(length))
         except TimeoutError:
             return self.reply(408, status="timeout")
+        if media_type == "application/json":
+            try:
+                payload = json.loads(data)
+                if not isinstance(payload, dict) or set(payload) != {"image_base64"}:
+                    return self.reply(400, status="invalid_test_payload")
+                data = base64.b64decode(payload["image_base64"], validate=True)
+            except (UnicodeError, ValueError, TypeError, binascii.Error):
+                return self.reply(400, status="invalid_test_payload")
         if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), fixture_digest):
             return self.reply(422, status="unknown_test_fixture")
         try:
